@@ -5,7 +5,7 @@ import express from "express";
 import cors from "cors";
 import helmet from "helmet";
 import cookieParser from "cookie-parser";
-import rateLimit from "express-rate-limit";
+// import rateLimit from "express-rate-limit";
 
 import { connectDB } from "../src/lib/mongodb.js";
 //routes
@@ -25,12 +25,12 @@ app.use(
   })
 );
 
-app.use(
-  rateLimit({
-    windowMs: 60 * 1000,
-    max: 120,
-  })
-);
+// app.use(
+//   rateLimit({
+//     windowMs: 60 * 1000,
+//     max: 120,
+//   })
+// );
 
 await connectDB(process.env.MONGODB_URI);
 
