@@ -94,7 +94,7 @@ router.post("/signup", async (req, res) => {
   if (!email || !password || !name) {
     return res.status(400).json({ error: "Missing fields" });
   }
-
+  console.log(name, email, password);
   const lowerEmail = email.toLowerCase();
   const existing = await User.findOne({ email: lowerEmail });
   if (existing) {
