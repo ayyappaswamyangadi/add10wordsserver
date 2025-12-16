@@ -1,4 +1,3 @@
-// backend/routes/words.js
 import dotenv from "dotenv";
 dotenv.config();
 
@@ -17,7 +16,7 @@ if (!JWT_SECRET) {
 }
 
 /**
- * Module-level flag to avoid re-running index creation on every invocation
+ * Module-level flag to avoid re-running index creation
  */
 let indexEnsured = false;
 async function ensureWordLowerIndexOnce() {
@@ -63,6 +62,53 @@ function conflictsObj(db = [], inBatch = []) {
   };
 }
 
+/**
+ * Shared validation logic
+ */
+async function validateWords(words) {
+  const { cleaned, lowers } = normalizeList(words);
+
+  if (cleaned.length !== 10) {
+    return {
+      ok: false,
+      status: 400,
+      error: `Exactly 10 words required. Received ${cleaned.length}.`,
+      conflicts: conflictsObj([], []),
+    };
+  }
+
+  // in-batch duplicates
+  const counts = new Map();
+  lowers.forEach((l) => counts.set(l, (counts.get(l) || 0) + 1));
+  const inBatch = [...counts.entries()]
+    .filter(([, c]) => c > 1)
+    .map(([k]) => k);
+
+  // DB conflicts
+  const found = await Word.find(
+    { wordLower: { $in: lowers } },
+    { wordLower: 1 }
+  ).lean();
+
+  const existingLower = [
+    ...new Set(found.map((d) => d.wordLower.toLowerCase())),
+  ];
+
+  if (existingLower.length === 0 && inBatch.length === 0) {
+    return {
+      ok: true,
+      cleaned,
+      lowers,
+      conflicts: conflictsObj([], []),
+    };
+  }
+
+  return {
+    ok: false,
+    conflicts: conflictsObj(existingLower, inBatch),
+  };
+}
+
 // --------------------
 // Auth middleware
 // --------------------
@@ -84,98 +130,64 @@ router.use(async (req, res, next) => {
 });
 
 // =====================================================
+// POST /api/words/validate
+// =====================================================
+router.post("/validate", async (req, res) => {
+  try {
+    const result = await validateWords(req.body?.words);
+    if (!result.ok) {
+      return res.status(result.status || 200).json(result);
+    }
+
+    res.json({
+      ok: true,
+      message: "No conflicts",
+      conflicts: result.conflicts,
+    });
+  } catch (err) {
+    console.error("Validation failed:", err);
+    res.status(500).json({ error: "Validation failed" });
+  }
+});
+
+// =====================================================
 // POST /api/words
-// - validate or submit words
 // =====================================================
 router.post("/", async (req, res) => {
-  const action = String(req.query?.action ?? "").toLowerCase();
-  const items = Array.isArray(req.body?.words) ? req.body.words : [];
-
-  const { cleaned, lowers } = normalizeList(items);
-
-  if (cleaned.length !== 10) {
-    return res.status(400).json({
-      error: `Exactly 10 words required. Received ${cleaned.length}.`,
-      conflicts: conflictsObj([], []),
-    });
-  }
-
-  // in-batch duplicates
-  const counts = new Map();
-  lowers.forEach((l) => counts.set(l, (counts.get(l) || 0) + 1));
-  const inBatch = [...counts.entries()]
-    .filter(([, c]) => c > 1)
-    .map(([k]) => k);
-
-  // check DB conflicts
-  let existingLower = [];
   try {
-    const found = await Word.find(
-      { wordLower: { $in: lowers } },
-      { wordLower: 1 }
-    ).lean();
-    existingLower = [...new Set(found.map((d) => d.wordLower.toLowerCase()))];
-  } catch (err) {
-    console.error("DB fetch failed:", err);
-    return res.status(500).json({ error: "DB fetch failed" });
-  }
+    const result = await validateWords(req.body?.words);
 
-  // VALIDATE ONLY
-  if (action === "validate") {
-    if (existingLower.length === 0 && inBatch.length === 0) {
-      return res.json({
-        ok: true,
-        message: "No conflicts",
-        conflicts: conflictsObj([], []),
+    if (!result.ok) {
+      return res.status(409).json({
+        error: "Conflicts found. Fix duplicates before submitting.",
+        conflicts: result.conflicts,
       });
     }
-    return res.json({
-      ok: false,
-      message: "Conflicts found",
-      conflicts: conflictsObj(existingLower, inBatch),
-    });
-  }
 
-  // SUBMIT
-  if (existingLower.length > 0 || inBatch.length > 0) {
-    return res.status(409).json({
-      error: "Conflicts found. Fix duplicates before submitting.",
-      conflicts: conflictsObj(existingLower, inBatch),
-    });
-  }
+    const docs = result.cleaned.map((w) => ({
+      userId: req.user.id,
+      word: w,
+      wordLower: w.toLowerCase(),
+      addedAt: new Date(),
+    }));
 
-  const docs = cleaned.map((w) => ({
-    userId: req.user.id,
-    word: w,
-    wordLower: w.toLowerCase(),
-    addedAt: new Date(),
-  }));
-
-  try {
     const inserted = await Word.insertMany(docs, { ordered: true });
-    return res.json({ added: inserted.length });
+    res.json({ added: inserted.length });
   } catch (err) {
     console.error("Insert failed:", err);
+
     if (err.code === 11000) {
-      const nowExisting = await Word.find(
-        { wordLower: { $in: lowers } },
-        { wordLower: 1 }
-      ).lean();
       return res.status(409).json({
         error: "One or more words already exist",
-        conflicts: conflictsObj(
-          nowExisting.map((d) => d.wordLower),
-          []
-        ),
       });
     }
-    return res.status(500).json({ error: "Insert failed" });
+
+    res.status(500).json({ error: "Insert failed" });
   }
 });
 
 // =====================================================
 // GET /api/words
-// - return mine + all
 // =====================================================
 router.get("/", async (req, res) => {
   const { sort = "date-desc", from, to, q = "" } = req.query;
@@ -208,25 +220,22 @@ router.get("/", async (req, res) => {
       ...new Set(allDocs.map((w) => String(w.userId)).filter(Boolean)),
     ];
 
-    let ownerMap = {};
-    if (userIds.length > 0) {
-      const owners = await User.find(
-        { _id: { $in: userIds } },
-        { name: 1, email: 1 }
-      ).lean();
+    const owners = await User.find(
+      { _id: { $in: userIds } },
+      { name: 1, email: 1 }
+    ).lean();
 
-      ownerMap = Object.fromEntries(
-        owners.map((u) => [String(u._id), u.name?.trim() || u.email])
-      );
-    }
+    const ownerMap = Object.fromEntries(
+      owners.map((u) => [String(u._id), u.name?.trim() || u.email])
+    );
 
     const attachOwner = (docs) =>
       docs.map((d) => ({
         _id: String(d._id),
         word: d.word,
         wordLower: d.wordLower,
-        userId: d.userId ? String(d.userId) : undefined,
-        addedAt: d.addedAt ? new Date(d.addedAt).toISOString() : null,
+        userId: String(d.userId),
+        addedAt: d.addedAt?.toISOString(),
         ownerName: ownerMap[String(d.userId)] || "Unknown",
       }));
 
